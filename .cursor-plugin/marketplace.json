@@ -1,0 +1,14 @@
+{
+	"name": "forculus",
+	"owner": { "name": "Forculus" },
+	"metadata": {
+		"description": "Forculus for agents: deploy an app in one step and say who can open it."
+	},
+	"plugins": [
+		{
+			"name": "forculus",
+			"source": "plugins/forculus",
+			"description": "Deploy the app you built in one step, share it like a document, and see who used it."
+		}
+	]
+}

@@ -1,0 +1,12 @@
+{
+	"name": "forculus",
+	"description": "Forculus for agents: deploy, share and watch apps from whatever built them.",
+	"owner": { "name": "Forculus" },
+	"plugins": [
+		{
+			"name": "forculus",
+			"source": "./plugins/forculus",
+			"description": "Deploy the app you built in one step, share it like a document, and see who used it."
+		}
+	]
+}

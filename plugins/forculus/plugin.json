@@ -1,0 +1,11 @@
+{
+	"$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+	"name": "forculus",
+	"version": "0.1.6",
+	"description": "Deploy the app you built in one step, share it like a document, and see who used it.",
+	"author": { "name": "Forculus", "url": "https://forculuslabs.tech" },
+	"homepage": "https://forculuslabs.tech",
+	"repository": "https://github.com/Forculus-Labs/forculus",
+	"license": "Apache-2.0",
+	"keywords": ["forculus", "deploy", "hosting", "sharing", "access-control", "cloudflare", "mcp", "ai-agents", "internal-tools", "audit-log"]
+}

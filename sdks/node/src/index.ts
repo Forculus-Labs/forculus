@@ -1,0 +1,351 @@
+// Verifies the X-Forculus-Identity token the edge sends your app.
+// X-Forculus-Email and X-Forculus-Role are for display only.
+//
+//   import { requireUser, Unauthorized } from "@forculus/sdk";
+//   export default {
+//     async fetch(request, env) {
+//       try {
+//         const user = await requireUser(request, env);
+//         return new Response(`hello ${user.email}`);
+//       } catch (err) {
+//         if (err instanceof Unauthorized) return err.toResponse();
+//         throw err;
+//       }
+//     },
+//   };
+//
+// A webhook delivery on a verified public path carries a token too, of its own kind:
+// `requireWebhook(request, env, { provider: "stripe" })` checks it, and `requireUser` refuses it.
+//
+// Works anywhere with WebCrypto and fetch (Workers, Node 20+, Deno, Bun). The build bundles jose.
+//
+// Docs: https://forculuslabs.tech/docs/sdks/node/
+
+import { createRemoteJWKSet, customFetch, decodeProtectedHeader, jwtVerify, type JWTVerifyGetKey } from "jose";
+import { JWKSNoMatchingKey } from "jose/errors";
+
+export const IDENTITY_HEADER = "x-forculus-identity";
+
+// The edge's claim names, in the case it writes them.
+const CLAIM_NAMES = new Set([
+	"iss", "aud", "sub", "exp", "iat", "nbf", "jti", "kind", "email", "role", "wid",
+	"provider", "pattern", "delivery", "signed_at", "agent_name",
+]);
+
+/** Vars the platform binds into every app. */
+export interface ForculusEnv {
+	/** Your app's id, used as the only accepted audience. */
+	FORCULUS_APP_ID?: string;
+	FORCULUS_IDENTITY_ISSUER?: string;
+	FORCULUS_JWKS_URL?: string;
+	/**
+	 * "1" only under `forculus dev`, which lets the issuer and key set be http on this machine. The
+	 * platform never sets it, and nothing else about verifying changes with it.
+	 */
+	FORCULUS_DEV?: string;
+}
+
+/** What a caller may do with this app. Ordered: an owner can do what an editor can. */
+export type Role = "viewer" | "editor" | "owner";
+
+const RANK: Record<string, number> = { viewer: 1, editor: 2, owner: 3 };
+
+export interface User {
+	/** "user" for a person; "service" for a bypass token, a workspace's agent or a scheduled job. */
+	kind: "user" | "service";
+	/**
+	 * Stable id. The person's platform id ("usr_…"), "service:<token id>", "agent:<agent id>" or
+	 * "scheduler:<schedule id>".
+	 */
+	sub: string;
+	/** Null for service tokens and agents. */
+	email: string | null;
+	role: Role;
+	workspaceId: string;
+	/** The agent's name, as the workspace calls it, when an agent called. Null for everyone else. */
+	agentName: string | null;
+}
+
+/** An agent's `sub` starts with this, and its id follows. */
+const AGENT_PREFIX = "agent:";
+
+/** Whether a workspace's agent made this request, rather than a person, a bypass token or a scheduled job. */
+export function isAgent(user: User): boolean {
+	return user.agentName !== null;
+}
+
+export class Unauthorized extends Error {
+	override name = "Unauthorized";
+	readonly status = 401;
+	toResponse(): Response {
+		return new Response("unauthorized", { status: 401, headers: { "cache-control": "no-store" } });
+	}
+}
+
+/** The caller is who they say they are, but not allowed to do this. */
+export class Forbidden extends Error {
+	override name = "Forbidden";
+	readonly status = 403;
+	constructor(readonly needed: Role) {
+		super(`this needs ${needed}`);
+	}
+	/** `forbidden: this needs editor`, as plain text: the same 403 every SDK answers. */
+	toResponse(): Response {
+		return new Response(`forbidden: ${this.message}`, {
+			status: 403,
+			headers: { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" },
+		});
+	}
+}
+
+/**
+ * Whether the caller has at least this much.
+ *
+ * A role this version doesn't know counts for nothing: if the platform ever adds one, an app
+ * built against an older SDK refuses rather than guessing what it allows.
+ */
+export function hasRole(user: User, least: Role): boolean {
+	const need = RANK[least];
+	// Asking for a role that doesn't exist allows nobody, the same way being one counts for
+	// nothing. A typo in either place should refuse, not wave everyone through.
+	return need !== undefined && (RANK[user.role] ?? 0) >= need;
+}
+
+/** Like `hasRole`, but throws `Forbidden` so a handler can answer with it. */
+export function requireRole(user: User, least: Role): void {
+	if (!hasRole(user, least)) throw new Forbidden(least);
+}
+
+export interface VerifyOptions {
+	/** Clock override in epoch milliseconds, for tests. */
+	now?: number;
+	/** Override fetch for the JWKS, for tests or custom transports. */
+	fetch?: (input: string, init: RequestInit) => Promise<Response>;
+}
+
+const keySets = new Map<string, JWTVerifyGetKey>();
+
+/** Returns the verified caller or throws Unauthorized. */
+export async function requireUser(request: Request, env: ForculusEnv, options: VerifyOptions = {}): Promise<User> {
+	const token = request.headers.get(IDENTITY_HEADER);
+	if (!token) throw new Unauthorized("no identity token");
+	return verifyIdentity(token, env, options);
+}
+
+/** Like requireUser, for a token you already have. */
+export async function verifyIdentity(token: string, env: ForculusEnv, options: VerifyOptions = {}): Promise<User> {
+	const payload = await verified(token, env, options, "");
+	const { aud, kind, sub, email, role, wid } = payload;
+	// jose takes a list holding our audience as well. The edge writes a single string, as the
+	// webhook check below has it too.
+	if (typeof aud !== "string" || (kind !== "user" && kind !== "service") || typeof sub !== "string" || sub === "") {
+		throw new Unauthorized("invalid identity token");
+	}
+	if (kind === "user" && typeof email !== "string") throw new Unauthorized("invalid identity token");
+	if (typeof role !== "string" || typeof wid !== "string") throw new Unauthorized("invalid identity token");
+	// An agent's token always says who it is. Anyone else's says nothing by the claim, as a bypass
+	// token's email says nothing.
+	let agentName: string | null = null;
+	if (kind === "service" && sub.startsWith(AGENT_PREFIX)) {
+		const name = payload.agent_name;
+		if (sub.length === AGENT_PREFIX.length || typeof name !== "string" || name === "") throw new Unauthorized("invalid identity token");
+		agentName = name;
+	}
+	return { kind, sub, email: kind === "user" ? (email as string) : null, role: role as Role, workspaceId: wid, agentName };
+}
+
+/** Who signs the webhooks the platform can check for you. */
+export type Provider = "stripe" | "github" | "slack" | "shopify" | "standard_webhooks" | "hmac_sha256";
+
+const PROVIDERS: ReadonlySet<string> = new Set<Provider>(["stripe", "github", "slack", "shopify", "standard_webhooks", "hmac_sha256"]);
+
+/**
+ * A delivery whose signature the platform checked before it reached your app, on a public path
+ * with a verifier. Not a person: it has no email and no role.
+ */
+export interface Webhook {
+	provider: Provider;
+	/** The public path pattern it arrived on, such as "/hooks/stripe". */
+	pattern: string;
+	/** The provider's signed id for this delivery, where it signs one. Dedupe on it. */
+	delivery: string | null;
+	/** When the provider signed it, in unix seconds, where it signs a time. */
+	signedAt: number | null;
+	workspaceId: string;
+}
+
+export interface WebhookOptions extends VerifyOptions {
+	/**
+	 * The provider or providers this route takes. A delivery from any other is refused, and so is
+	 * every delivery when the list is empty.
+	 */
+	provider: Provider | readonly Provider[];
+}
+
+/**
+ * Returns the webhook the platform verified for this request, or throws Unauthorized. A person's
+ * or a bypass token's identity is refused here, as a webhook's is by requireUser.
+ */
+export async function requireWebhook(request: Request, env: ForculusEnv, options: WebhookOptions): Promise<Webhook> {
+	const token = request.headers.get(IDENTITY_HEADER);
+	if (!token) throw new Unauthorized("no identity token");
+	return verifyWebhook(token, env, options);
+}
+
+/** Like requireWebhook, for a token you already have. */
+export async function verifyWebhook(token: string, env: ForculusEnv, options: WebhookOptions): Promise<Webhook> {
+	// Named by the caller, so a Stripe route can't be handed a GitHub delivery because a pattern was
+	// widened later. Read before anything is fetched: an empty list refuses everything anyway.
+	const given: unknown = options?.provider;
+	const wanted: readonly unknown[] = typeof given === "string" ? [given] : Array.isArray(given) ? given : [];
+	if (wanted.length === 0) throw new Unauthorized("no provider named");
+
+	const payload = await verified(token, env, options, WEBHOOK_AUDIENCE);
+	const { aud, kind, sub, wid, provider, pattern } = payload;
+	// jose takes a list holding our audience as well. The edge writes a single string.
+	if (typeof aud !== "string" || kind !== "webhook" || typeof sub !== "string" || sub === "" || typeof wid !== "string") {
+		throw new Unauthorized("invalid webhook token");
+	}
+	// A provider this version doesn't know matches nothing, even when the caller lists it.
+	if (typeof provider !== "string" || !PROVIDERS.has(provider) || !wanted.includes(provider)) {
+		throw new Unauthorized("not a webhook this route takes");
+	}
+	if (typeof pattern !== "string" || pattern === "") throw new Unauthorized("invalid webhook token");
+
+	// Left out where the provider signs no id or no time. When there, each is what the edge writes.
+	const { delivery, signed_at: signedAt } = payload;
+	if (Object.hasOwn(payload, "delivery") && (typeof delivery !== "string" || delivery === "")) {
+		throw new Unauthorized("invalid webhook token");
+	}
+	if (Object.hasOwn(payload, "signed_at") && !(Number.isSafeInteger(signedAt) && (signedAt as number) >= 0)) {
+		throw new Unauthorized("invalid webhook token");
+	}
+
+	return {
+		provider: provider as Provider,
+		pattern,
+		delivery: typeof delivery === "string" ? delivery : null,
+		signedAt: typeof signedAt === "number" ? signedAt : null,
+		workspaceId: wid,
+	};
+}
+
+// A webhook's token is addressed to "webhook:<app id>", never to the app id alone, so a check
+// written for people can't take a delivery for someone signed in.
+const WEBHOOK_AUDIENCE = "webhook:";
+
+/** The checks every token gets, whoever it's for: signature, issuer, audience, times, claim names. */
+async function verified(token: string, env: ForculusEnv, options: VerifyOptions, audiencePrefix: string): Promise<Record<string, unknown>> {
+	const { FORCULUS_APP_ID: appId, FORCULUS_IDENTITY_ISSUER: issuer, FORCULUS_JWKS_URL: jwksUrl } = env;
+	if (!appId || !issuer || !jwksUrl) {
+		// Deny if any are missing, since there's nothing to check the token against.
+		throw new Unauthorized("FORCULUS_APP_ID, FORCULUS_IDENTITY_ISSUER and FORCULUS_JWKS_URL must be set");
+	}
+	// Before any key is fetched, so a deployed app left pointing at a dev edge asks nobody for keys.
+	if (!originAllowed(issuer, jwksUrl, env.FORCULUS_DEV)) throw new Unauthorized(ORIGIN_REFUSED);
+
+	let payload: Record<string, unknown>;
+	try {
+		// Without a kid jose would try the only key in the set. The edge always sends one.
+		const { kid } = decodeProtectedHeader(token);
+		if (typeof kid !== "string" || kid === "") throw new Unauthorized("invalid identity token");
+		({ payload } = await jwtVerify(token, keySet(jwksUrl, options), {
+			// Pinned so the token's own alg header can't pick the algorithm.
+			algorithms: ["RS256"],
+			issuer,
+			audience: audiencePrefix + appId,
+			requiredClaims: ["exp", "iat", "sub"],
+			currentDate: options.now === undefined ? undefined : new Date(options.now),
+			clockTolerance: 0,
+		}));
+	} catch (err) {
+		// Said the way the other SDKs say it, so a platform that can't be reached isn't taken for a bad token.
+		if (err instanceof KeysUnavailable) throw new Unauthorized("couldn't fetch the identity keys");
+		throw new Unauthorized("invalid identity token");
+	}
+
+	// Go's JSON decoder matches "EXP" to exp, so every SDK refuses names like it to stay in step.
+	for (const name of Object.keys(payload)) {
+		if (CLAIM_NAMES.has(name.toLowerCase()) && !CLAIM_NAMES.has(name)) throw new Unauthorized("invalid identity token");
+	}
+	return payload;
+}
+
+const ORIGIN_REFUSED = "FORCULUS_IDENTITY_ISSUER and FORCULUS_JWKS_URL must use https, except under forculus dev (FORCULUS_DEV=1, on this machine)";
+
+/**
+ * Whether tokens may be taken from this issuer, with keys from this URL.
+ *
+ * The platform's are always https. Only `forculus dev` uses http, on this machine, and it sets
+ * FORCULUS_DEV=1 for the app it runs. The platform never sets that and refuses it as an app's
+ * variable, so a dev issuer left in a deployed app's config refuses everyone rather than trusting
+ * whatever answers on that port.
+ */
+function originAllowed(issuer: string, jwksUrl: string, dev: string | undefined): boolean {
+	if (isHttps(issuer) && isHttps(jwksUrl)) return true;
+	if (dev !== "1") return false;
+	// The issuer is only compared, never fetched, so it names this machine. The keys may come from
+	// the machine running Docker too, which is how a container reaches `forculus dev`.
+	return onThisMachine(issuer, false) && onThisMachine(jwksUrl, true);
+}
+
+function isHttps(url: string): boolean {
+	return url.slice(0, 8).toLowerCase() === "https://";
+}
+
+const THIS_MACHINE = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const DOCKER_HOST = "host.docker.internal";
+
+function onThisMachine(raw: string, orDockerHost: boolean): boolean {
+	// Anything two URL parsers might read differently is refused rather than reasoned about.
+	if (/[\\@\s]/.test(raw)) return false;
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		return false;
+	}
+	if (url.protocol !== "http:") return false;
+	// As written, not as parsed: URL reads 127.1 and 0x7f000001 as 127.0.0.1, where other parsers
+	// don't, so a name this takes is one every SDK takes.
+	const host = writtenHost(raw);
+	if (host !== url.hostname) return false;
+	return THIS_MACHINE.has(host) || (orDockerHost && host === DOCKER_HOST);
+}
+
+/** The host between `//` and the port or path, lowercased, brackets kept. */
+function writtenHost(raw: string): string {
+	const authority = ((raw.split("//", 2)[1] ?? "").split(/[/?#]/, 1)[0] ?? "").toLowerCase();
+	return authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : (authority.split(":", 1)[0] ?? "");
+}
+
+/** The key set couldn't be had: the fetch failed, or what came back wasn't a key set. */
+class KeysUnavailable extends Error {}
+
+function keySet(url: string, options: VerifyOptions): JWTVerifyGetKey {
+	let set = keySets.get(url);
+	if (!set) {
+		const remote = createRemoteJWKSet(new URL(url), {
+			cacheMaxAge: 5 * 60_000,
+			cooldownDuration: 10_000,
+			timeoutDuration: 3_000,
+			...(options.fetch ? { [customFetch]: options.fetch } : {}),
+		});
+		set = async (header, token) => {
+			try {
+				return await remote(header, token);
+			} catch (err) {
+				// Keys that arrived without the one the token names say something about the token.
+				if (err instanceof JWKSNoMatchingKey) throw err;
+				throw new KeysUnavailable();
+			}
+		};
+		keySets.set(url, set);
+	}
+	return set;
+}
+
+/** Clears cached key sets, for tests. */
+export function clearKeyCache(): void {
+	keySets.clear();
+}

@@ -1,0 +1,214 @@
+# @forculus/sdk
+
+Verifies who is calling your Forculus app. Full docs: https://forculuslabs.tech/docs/sdks/node/
+
+The edge sends a 60-second identity token in `X-Forculus-Identity` on every request it lets through.
+`requireUser` checks the RS256 signature against the platform's keys, plus issuer, audience (your
+app) and expiry, and returns the caller. A missing or bad token throws `Unauthorized`, and so does a
+request that only carries `X-Forculus-Email`.
+
+```sh
+npm install @forculus/sdk
+```
+
+```js
+import { requireUser, Unauthorized } from "@forculus/sdk";
+
+export default {
+	async fetch(request, env) {
+		try {
+			const user = await requireUser(request, env);
+			return new Response(`hello ${user.email}`);
+		} catch (err) {
+			if (err instanceof Unauthorized) return err.toResponse();
+			throw err;
+		}
+	},
+};
+```
+
+It runs anywhere with WebCrypto and `fetch`: Workers, Node 20+, Deno and Bun.
+
+`requireRole(user, "editor")` throws `Forbidden` (403) when the caller's role is too low.
+`Unauthorized` (401) means there is no valid caller. `hasRole` checks the role without throwing.
+Both errors have `.toResponse()`.
+
+## Your framework
+
+Each of these is a subpath, so a Next app never loads the Express one.
+
+### Next.js
+
+```ts
+import { getUser, requireUser } from "@forculus/sdk/next";
+
+export default async function Page() {
+	const user = await getUser();
+	return <p>hello {user?.email ?? "stranger"}</p>;
+}
+```
+
+Reads the request's own headers through `next/headers`, in a server component or a route handler.
+In a page, use `getUser()`: it answers `null` when there's no valid caller. `requireUser()` throws
+`Unauthorized`, which a server component turns into a 500, so keep it for route handlers and answer
+with `err.toResponse()`. Pass `headers` yourself to use it somewhere `next/headers` isn't.
+
+### Express
+
+```js
+import { requireUser } from "@forculus/sdk/express";
+
+app.use(requireUser());
+app.get("/", (req, res) => res.send(`hello ${req.user.email}`));
+```
+
+401 without an identity, 403 with `requireUser({ role: "editor" })` and a caller who isn't one.
+Neither reaches the handler. `withUser()` lets everyone through and sets `req.user` when there is
+one. The same shape works for Connect and Fastify's Express plugin.
+
+### Hono
+
+```js
+import { getUser, forculus } from "@forculus/sdk/hono";
+
+app.use("*", forculus());
+app.get("/", (c) => c.text(`hello ${getUser(c).email}`));
+```
+
+`getUser(c)` throws if the middleware didn't run on that route, so a handler never runs without a
+verified caller. The platform's variables come from Hono's bindings on
+Workers and from `process.env` on Node, Bun and Deno, so the same line works in a container.
+
+### node:http, Koa, anything else
+
+```js
+import { envFromProcess, requireUserFrom } from "@forculus/sdk/node";
+
+const user = await requireUserFrom(req, envFromProcess());
+```
+
+It takes Node-style headers. A request carrying the token twice is refused. The edge sends exactly
+one, so a second came from somewhere else.
+
+## Webhooks
+
+A webhook provider can't sign in, so its route is a public path, opened in the dashboard (Sharing,
+Public paths) along with the provider that signs it and that provider's signing secret. The platform
+checks each delivery's signature before your app sees it and sends it on with a token of kind
+`webhook`. `requireWebhook` checks that token and tells you which provider it came from. Your app
+never holds the signing secret.
+
+```js
+import { requireWebhook, Unauthorized } from "@forculus/sdk";
+
+export default {
+	async fetch(request, env) {
+		if (new URL(request.url).pathname === "/hooks/stripe") {
+			try {
+				const hook = await requireWebhook(request, env, { provider: "stripe" });
+				const event = await request.json();
+				// hook.delivery is Stripe's event id. Skip one you've handled.
+				return new Response(null, { status: 204 });
+			} catch (err) {
+				if (err instanceof Unauthorized) return err.toResponse();
+				throw err;
+			}
+		}
+		// ...requireUser for everything else
+	},
+};
+```
+
+`provider` is required: one of `stripe`, `github`, `slack`, `shopify`, `standard_webhooks` and
+`hmac_sha256`, or a list of them. A delivery from any other provider is refused, so a Stripe route
+can't be handed a GitHub delivery after a pattern is widened. `requireUser` refuses a webhook's
+token and `requireWebhook` refuses a person's.
+
+It returns `{ provider, pattern, delivery, signedAt, workspaceId }`. `pattern` is the public path it
+came in on, such as `/hooks/stripe` or `/hooks/*`. `delivery` is the provider's signed id for it and
+`signedAt` the signed time in unix seconds, each where the provider signs one (Stripe, Slack events,
+Standard Webhooks) and `null` otherwise.
+
+The body arrives as the provider sent it, and your app doesn't need the raw bytes, so
+`express.json()` or `await request.json()` is fine.
+
+Mount a webhook's route so app-wide user checks never see it:
+
+```js
+// Express: the route first, since app.use(requireUser()) would refuse the delivery.
+import { requireUser, requireWebhook } from "@forculus/sdk/express";
+
+app.post("/hooks/stripe", express.json(), requireWebhook({ provider: "stripe" }), (req, res) => {
+	// req.webhook, req.body
+	res.sendStatus(204);
+});
+app.use(requireUser());
+```
+
+```js
+// Hono: the same order, before app.use("*", forculus()).
+import { getWebhook, forculus, webhook } from "@forculus/sdk/hono";
+
+app.post("/hooks/stripe", webhook({ provider: "stripe" }), async (c) => {
+	const hook = getWebhook(c);
+	return c.body(null, 204);
+});
+app.use("*", forculus());
+```
+
+```ts
+// Next.js, app/hooks/stripe/route.ts
+import { Unauthorized } from "@forculus/sdk";
+import { requireWebhook } from "@forculus/sdk/next";
+
+export async function POST(request: Request) {
+	try {
+		await requireWebhook({ provider: "stripe" });
+	} catch (err) {
+		if (err instanceof Unauthorized) return err.toResponse();
+		throw err;
+	}
+	const event = await request.json();
+	return new Response(null, { status: 204 });
+}
+```
+
+With Node's own headers, `requireWebhookFrom(req, envFromProcess(), { provider: "github" })` from
+`/node`, which refuses a token that arrived twice.
+
+Keep these limits in mind:
+
+- Signed deliveries reach your app with a webhook token, and `requireWebhook` refuses everything
+  else. A route that skips it accepts anyone's request for up to a minute after a verifier is
+  added, permanently once one is removed, if the platform ever rolls its edge back, and on any
+  path that a more specific pattern with no verifier matches. A path in another case
+  (`/Hooks/Stripe`) goes to whatever pattern matches it and arrives with no token.
+- GitHub, Shopify and plain HMAC senders sign no time, so a captured delivery can be sent again at
+  any time, with a different query string and any header but the signature changed. Act on what the
+  signed body says, never on `X-GitHub-Event`, `X-Shopify-Topic` or another header, and make that
+  safe to repeat.
+- On Stripe, Slack and Standard Webhooks the platform refuses a copy of a delivery your app answered
+  with a 2xx. Answer with anything else and a copy can get through within the provider's tolerance,
+  so dedupe on `delivery` there as well.
+
+## Configuration
+
+The platform sets `FORCULUS_APP_ID`, `FORCULUS_IDENTITY_ISSUER` and `FORCULUS_JWKS_URL`. On Workers
+they arrive as bindings, which is the `env` you pass. Everywhere else they're in `process.env`,
+which the `/express`, `/next` and `/hono` entries read for you, and `envFromProcess()` in `/node`
+reads for anything else. If any is missing, or the keys can't be fetched, every request is refused.
+
+Under [`forculus dev`](https://forculuslabs.tech/docs/sdks/local-development/) the issuer and keys are
+http on your machine, and it sets `FORCULUS_DEV=1` for your app (a Worker gets it as a binding). That is the only thing the variable
+does: an http issuer or key set is refused without it, and anywhere but this machine even with it.
+The platform's are https and it never sets the variable, so nothing about verifying changes there.
+
+`user.kind` is `"user"` (with `email`) or `"service"` for a bypass token (`email` is `null`).
+A scheduled job is `"service"` too, with a `user.sub` that starts with `"scheduler:"`. Check both
+before doing the job: anyone the app is shared with can call the same path.
+One of the workspace's agents is `"service"` as well, with a `user.sub` of `"agent:<agent id>"` and
+its name in `user.agentName` (`null` for everyone else). `isAgent(user)` says whether an agent
+called. Show the name, but decide what an agent may do by `sub`, since a name can change.
+`user.role` is the caller's access to this app.
+
+Tests: `pnpm test`

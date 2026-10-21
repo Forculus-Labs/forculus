@@ -1,0 +1,51 @@
+# Changelog
+
+## 0.3.1 - 2026-10-19
+
+- `RequireUser` and `Verify` refuse a token whose `aud` is a list, even one holding the app's id.
+  The edge writes one string, and `RequireWebhook` already refused a list.
+- A request with two `X-Forculus-Identity` headers is refused, as the Node SDK refuses it. It read
+  the first.
+
+## 0.3.0 - 2026-10-16
+
+- An issuer or key set on http is refused unless `FORCULUS_DEV` is `1`, and even then only on this
+  machine (`127.0.0.1`, `localhost` or `[::1]`, and for the keys `host.docker.internal` too).
+  `forculus dev` sets it for the app it runs, from CLI 0.1.11. The platform's issuer and keys are
+  https and it never sets `FORCULUS_DEV`, so a deployed app that still points at `forculus dev`
+  refuses everyone, and asks nobody for keys.
+- `Config` has `Dev`, which `ConfigFromEnv` reads from `FORCULUS_DEV`. `NewVerifier` returns an error
+  for an http issuer or key set unless `Dev` is true. That is why this is 0.3.0.
+
+## 0.2.0 - 2026-10-06
+
+- `User` has `AgentName`: the name of the workspace's agent that made the request, or empty for a
+  person, a bypass token or a scheduled job. `user.IsAgent()` says whether an agent called. Decide
+  what an agent may do by `Sub`, which is `agent:<agent id>`. The name can change.
+- `User` marshals `agent_name` too, `null` when empty, as the other SDKs write it.
+- An agent's identity token with no name, an empty one, or an empty agent id is refused, as a
+  person's with no email is. The platform always sends one.
+- A `User` written as an unkeyed literal (`User{"user", ...}`) no longer compiles. Name the fields.
+
+## 0.1.2 - 2026-10-01
+
+- The README is rewritten in plain words. Nothing in the SDK's behaviour changed.
+
+## 0.1.1 - 2026-09-25
+
+- `Requires` answers its 403, `forbidden: this needs editor`, with no newline after it, the same
+  body every SDK answers.
+
+## 0.1.0 - 2026-09-25
+
+First release, so there is nothing to upgrade from.
+
+- `RequireUser`, `Verify`, `Middleware` and `Requires` check the identity token the platform sends
+  with a person's or a bypass token's request.
+- `RequireWebhook`, `VerifyWebhook` and `WebhookMiddleware` (with `WebhookFrom`) check the token it
+  sends with a webhook delivery whose signature it verified, and name the provider. Each kind of
+  token is refused where the other is expected.
+- `User` and `Webhook` marshal to JSON with the names the Python and Rust SDKs use: `kind`, `sub`,
+  `email`, `role` and `workspace_id`, and `provider`, `pattern`, `delivery`, `signed_at` and
+  `workspace_id`. An empty email or delivery id is `null`, and `signed_at` is unix seconds or
+  `null`.

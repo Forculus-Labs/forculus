@@ -1,0 +1,149 @@
+# forculus (Rust)
+
+Verifies who is calling your Forculus app. Full docs: https://forculuslabs.tech/docs/sdks/rust/
+
+The edge signs a 60-second identity token for each request it lets through and sends it in
+`X-Forculus-Identity`. `Verifier::require_user` checks it against the platform's published keys
+(signature, RS256 only, issuer, your app as the audience, expiry) and returns the caller.
+Anything else, including a missing token or a request that only carries `X-Forculus-Email`, is
+`Unauthorized`.
+
+```sh
+cargo add forculus
+```
+
+```rust
+// Once, at startup: reads FORCULUS_APP_ID, FORCULUS_IDENTITY_ISSUER and FORCULUS_JWKS_URL.
+let verifier = forculus::Verifier::from_env()?;
+
+// Per request, from any `http::HeaderMap`: axum's, hyper's, your own.
+let user = verifier.require_user(&headers).await?;
+```
+
+`from_env` returns an error if any of the three is missing.
+Under [`forculus dev`](https://forculuslabs.tech/docs/sdks/local-development/) the issuer and keys are
+http on your machine, and it sets `FORCULUS_DEV=1` for your app. That is the only thing the variable
+does: an http issuer or key set is refused without it, and anywhere but this machine even with it.
+The platform's are https and it never sets the variable, so nothing about verifying changes there.
+
+`user.require_role(Role::Editor)` returns `Forbidden` when the caller's role is too low.
+`Unauthorized` means there is no valid caller. `has_role` checks without returning an error.
+
+## axum
+
+```toml
+forculus = { version = "0.3", features = ["axum"] }
+```
+
+```rust
+use axum::{Router, routing::{get, post}};
+use forculus::{Role, User, Verifier, axum::Forculus};
+
+let verifier = Verifier::from_env()?;
+let app = Router::new()
+    .route("/", get(index))
+    .route("/orders", post(place_order).layer(Forculus::new(verifier.clone()).requires(Role::Editor)))
+    .layer(Forculus::new(verifier.clone()))
+    .with_state(verifier);
+
+async fn index(user: User) -> String {
+    format!("hello {}", user.email.as_deref().unwrap_or(&user.sub))
+}
+```
+
+The layer verifies before the handler, answers 401 or 403 itself, and puts the caller in the
+request's extensions. `User` is also an extractor for routes outside the layer, which is why the
+router has `with_state(verifier)`. Behind the layer, the extractor reads what the layer found
+instead of verifying again.
+
+## Webhooks
+
+A webhook provider can't sign in, so its route is a public path, opened in the dashboard (Sharing,
+Public paths) along with the provider that signs it and that provider's signing secret. The platform
+checks each delivery's signature before your app sees it and sends it on with a token of kind
+`webhook`. `Verifier::require_webhook` checks that token and tells you which provider it came from.
+Your app never holds the signing secret.
+
+```rust
+use forculus::Provider;
+
+let hook = verifier.require_webhook(&headers, &[Provider::Stripe]).await?;
+// hook.delivery is Stripe's event id. Skip one you've handled.
+```
+
+With axum, the webhook's routes get a router of their own behind `ForculusWebhook`, merged after
+the user layer so that layer never sees the delivery. The `Webhook` extractor reads only what
+`ForculusWebhook` verified.
+
+```rust
+use forculus::{Provider, Webhook, axum::{Forculus, ForculusWebhook}};
+
+let hooks = Router::new()
+    .route("/hooks/stripe", post(stripe))
+    .layer(ForculusWebhook::new(verifier.clone(), [Provider::Stripe]));
+let app = Router::new()
+    .route("/", get(index))
+    .layer(Forculus::new(verifier.clone()))
+    .merge(hooks)
+    .with_state(verifier);
+
+async fn stripe(hook: Webhook, body: String) -> StatusCode {
+    // The body arrives as Stripe sent it; parse it however you like.
+    StatusCode::NO_CONTENT
+}
+```
+
+Name the provider or providers a route takes. A delivery from any other is refused, and so is
+every delivery when the list is empty, so a Stripe route can't be handed a GitHub delivery after a
+pattern is widened. `require_user` refuses a webhook's token and `require_webhook` refuses a
+person's. `Provider::from_name("stripe")` reads a name from your own config.
+
+`hook.pattern` is the public path it came in on, such as `/hooks/stripe` or `/hooks/*`.
+`hook.delivery` is the provider's signed id for it and `hook.signed_at` the signed time in unix
+seconds, each where the provider signs one (Stripe, Slack events, Standard Webhooks) and `None`
+otherwise.
+
+Keep these limits in mind:
+
+- Signed deliveries reach your app with a webhook token, and `require_webhook` refuses everything
+  else. A route that skips it accepts anyone's request for up to a minute after a verifier is
+  added, permanently once one is removed, if the platform ever rolls its edge back, and on any
+  path that a more specific pattern with no verifier matches. A path in another case
+  (`/Hooks/Stripe`) goes to whatever pattern matches it and arrives with no token.
+- GitHub, Shopify and plain HMAC senders sign no time, so a captured delivery can be sent again at
+  any time, with a different query string and any header but the signature changed. Act on what the
+  signed body says, never on `X-GitHub-Event`, `X-Shopify-Topic` or another header, and make that
+  safe to repeat.
+- On Stripe, Slack and Standard Webhooks the platform refuses a copy of a delivery your app answered
+  with a 2xx. Answer with anything else and a copy can get through within the provider's tolerance,
+  so dedupe on `delivery` there as well.
+
+## Scheduled jobs
+
+A [scheduled job](https://forculuslabs.tech/docs/apps/schedules/) arrives as `kind` `"service"`, with a
+`sub` that starts with `"scheduler:"`. Check both before doing the job: anyone the app is shared
+with can call the same path.
+
+```rust
+if user.kind != forculus::Kind::Service || !user.sub.starts_with("scheduler:") {
+    return StatusCode::FORBIDDEN.into_response();
+}
+```
+
+## Agents
+
+One of the workspace's [agents](https://forculuslabs.tech/docs/access/agents/) arrives as `kind`
+`"service"` too, with a `sub` of `"agent:<agent id>"` and its name in `user.agent_name` (`None` for
+everyone else). `user.is_agent()` says whether an agent called. Show the name, but decide what an
+agent may do by `sub`, since a name can change.
+
+## Configuration
+
+The platform sets all three variables for your app. Without them, `from_env` fails. While the keys
+can't be fetched, every request is refused.
+
+The keys are fetched over TLS, trusting the public roots and, on top of them, the certificates in
+the file `SSL_CERT_FILE` names. A container's outbound TLS on the platform goes through a proxy
+whose CA is in that file, and the platform sets the variable for you.
+
+Tests: `cargo test -p forculus --all-features`
